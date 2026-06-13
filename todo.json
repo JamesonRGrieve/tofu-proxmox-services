@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "domain": "tofu.proxmox-services",
+  "title": "Proxmox Service-Install Orchestration Provider",
+  "description": "Drives per-guest service installs via the ansible repo and tracks installed-service state; companion to tofu-proxmox.",
+  "phases": [
+    {
+      "number": 1,
+      "title": "Ansible engine",
+      "exit_criteria": "internal/ansible builds; argv assembly, PLAY RECAP parsing, token capture/_ct_url, and about.json parsing unit-tested.",
+      "items": [
+        { "number": "1.1", "feature": "Playbook runner", "description": "ansible-playbook argv builder + exec with cwd + context timeout", "done": true },
+        { "number": "1.2", "feature": "Recap parser", "description": "ParseRecap ok/changed/unreachable/failed from PLAY RECAP", "done": true },
+        { "number": "1.3", "feature": "Token capture", "description": "provides_tokens output-file wiring + _ct_url synthesis", "done": true },
+        { "number": "1.4", "feature": "about.json", "description": "LoadAbout/ParseAbout structs", "done": true }
+      ]
+    },
+    {
+      "number": 2,
+      "title": "Resources",
+      "exit_criteria": "proxmoxsvc_service installs a service end-to-end; metadata data source reads about.json; provides_tokens wire into a dependent service.",
+      "items": [
+        { "number": "2.1", "feature": "proxmoxsvc_service", "description": "install/track CRUD + health-probe drift + import", "done": true },
+        { "number": "2.2", "feature": "proxmoxsvc_service_metadata", "description": "about.json data source", "done": true },
+        { "number": "2.3", "feature": "provider config", "description": "ansible_repo_path/vault/ssh + Configure -> Runner", "done": true }
+      ]
+    },
+    {
+      "number": 3,
+      "title": "Hardening",
+      "exit_criteria": "uninstall convention + NetBox/PVE-tag write-back of provides_tokens.",
+      "items": [
+        { "number": "3.1", "feature": "Uninstall playbooks", "description": "uninstall_<svc>.yml convention + Delete wiring", "done": false },
+        { "number": "3.2", "feature": "SoT write-back", "description": "stamp provides_tokens to PVE tags/description and NetBox local_context_data", "done": false }
+      ]
+    }
+  ]
+}
