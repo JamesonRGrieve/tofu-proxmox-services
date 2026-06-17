@@ -5,6 +5,25 @@ the neighbouring `ansible` repo. Companion to `tofu-proxmox` (guest lifecycle). 
 house standards; general Go / provider standards are canonical at
 `/home/jameson/source/ai-prompts/go.md`. This file holds only repo-specific facts.
 
+## Planned: rename → `tofu-services` + NetBox/Semaphore re-architecture (2026-06-17)
+
+Per the `netbox-services` design (`../netbox-services/DESIGN.md` §0), this repo is to be
+**renamed `tofu-proxmox-services → tofu-services`** before any adoption (zero state to
+migrate): the provider is host-agnostic (it shells ansible to an IP), so the `proxmox`
+prefix is misleading; guest-lifecycle is the separate `tofu-proxmox`. Concrete changes:
+
+- TypeName `proxmoxsvc` → `services`; resources `proxmoxsvc_service` →
+  **`services_instance`** + new **`services_integration`** (surface mirrors the NetBox
+  model: deployed instance + integration edge).
+- Read intent from **NetBox** (`ServiceInstance` + `Integration`), not hand-wired
+  `app_vars`; Tofu's graph orders providers→consumers via token refs.
+- Execution moves **through Semaphore**: `internal/ansible.Runner` (local subprocess) →
+  a **Semaphore client** that triggers the existing ansible templates; the services-apply
+  runs in a **separate Semaphore queue** to avoid task-pool starvation.
+
+The sections below describe the **current** (pre-rename) shape and stay accurate until
+the rename lands.
+
 ## Design
 
 - Provider local name (TypeName) is **`proxmoxsvc`** (distinct from the core `proxmox` provider so
