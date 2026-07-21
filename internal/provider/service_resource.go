@@ -28,6 +28,7 @@ var (
 	_ resource.Resource                = (*serviceResource)(nil)
 	_ resource.ResourceWithConfigure   = (*serviceResource)(nil)
 	_ resource.ResourceWithImportState = (*serviceResource)(nil)
+	_ resource.ResourceWithModifyPlan  = (*serviceResource)(nil)
 )
 
 // NewServiceResource constructs the proxmoxsvc_service resource.
@@ -307,9 +308,9 @@ func (r *serviceResource) Read(ctx context.Context, req resource.ReadRequest, re
 	about, err := ansible.LoadAbout(r.runner.RepoPath(), state.Service.ValueString())
 	if err == nil {
 		state.HealthEndpoint = types.StringValue(about.Verification.HealthEndpoint)
-		// Refresh the declared-token-set fingerprint so a plan shows a diff when about.json
-		// grew a token since the last apply (drives the init-only re-run in Update).
-		state.ProvidesTokensHash = types.StringValue(providesTokensSetHash(about))
+		// Deliberately do NOT refresh provides_tokens_hash here: Read runs before ModifyPlan,
+		// so overwriting it to the current value would hide the very growth ModifyPlan must
+		// detect. The stored (last-apply) hash is the baseline ModifyPlan compares against.
 		if ep := about.Verification.HealthEndpoint; ep != "" {
 			if !healthOK(state.TargetIP.ValueString(), about.DefaultPort, ep, about.Verification.HealthStatusCodes) {
 				state.LastApplied = types.StringValue("")
@@ -317,6 +318,34 @@ func (r *serviceResource) Read(ctx context.Context, req resource.ReadRequest, re
 		}
 	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
+}
+
+// ModifyPlan forces an in-place update when the service's DECLARED token set (about.json
+// provides_tokens keys) has grown since the last apply. A Computed-only attribute changing
+// during Read does not by itself produce a plan diff — the framework silently refreshes it —
+// so a provider-detected change like this needs the attribute marked Unknown here to surface
+// as "(known after apply)" and drive Update (where the init-only re-run runs). No-op on
+// create (null state) and destroy (null plan).
+func (r *serviceResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	if req.State.Raw.IsNull() || req.Plan.Raw.IsNull() {
+		return
+	}
+	var state serviceModel
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	about, err := ansible.LoadAbout(r.runner.RepoPath(), state.Service.ValueString())
+	if err != nil {
+		return // can't read intent → leave the plan untouched
+	}
+	if providesTokensSetHash(about) == state.ProvidesTokensHash.ValueString() {
+		return // token set unchanged → no init-only re-run needed
+	}
+	// The declared token set grew: force the token outputs to recompute so an Update runs.
+	resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("provides_tokens"), types.MapUnknown(types.StringType))...)
+	resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("provides_tokens_hash"), types.StringUnknown())...)
+	resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("last_applied"), types.StringUnknown())...)
 }
 
 func (r *serviceResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
