@@ -38,20 +38,21 @@ type serviceResource struct {
 }
 
 type serviceModel struct {
-	ID             types.String `tfsdk:"id"`
-	Service        types.String `tfsdk:"service"`
-	TargetIP       types.String `tfsdk:"target_ip"`
-	CTID           types.Int64  `tfsdk:"ct_id"`
-	Node           types.String `tfsdk:"node"`
-	AppPlaybook    types.String `tfsdk:"app_playbook"`
-	AppVars        types.Map    `tfsdk:"app_vars"`
-	SSHUser        types.String `tfsdk:"ssh_user"`
-	SSHPassword    types.String `tfsdk:"ssh_password"`
-	RunInit        types.Bool   `tfsdk:"run_init"`
-	AppVarsHash    types.String `tfsdk:"app_vars_hash"`
-	ProvidesTokens types.Map    `tfsdk:"provides_tokens"`
-	HealthEndpoint types.String `tfsdk:"health_endpoint"`
-	LastApplied    types.String `tfsdk:"last_applied"`
+	ID                 types.String `tfsdk:"id"`
+	Service            types.String `tfsdk:"service"`
+	TargetIP           types.String `tfsdk:"target_ip"`
+	CTID               types.Int64  `tfsdk:"ct_id"`
+	Node               types.String `tfsdk:"node"`
+	AppPlaybook        types.String `tfsdk:"app_playbook"`
+	AppVars            types.Map    `tfsdk:"app_vars"`
+	SSHUser            types.String `tfsdk:"ssh_user"`
+	SSHPassword        types.String `tfsdk:"ssh_password"`
+	RunInit            types.Bool   `tfsdk:"run_init"`
+	AppVarsHash        types.String `tfsdk:"app_vars_hash"`
+	ProvidesTokens     types.Map    `tfsdk:"provides_tokens"`
+	ProvidesTokensHash types.String `tfsdk:"provides_tokens_hash"`
+	HealthEndpoint     types.String `tfsdk:"health_endpoint"`
+	LastApplied        types.String `tfsdk:"last_applied"`
 }
 
 func (r *serviceResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -119,6 +120,12 @@ func (r *serviceResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 				ElementType:         types.StringType,
 				MarkdownDescription: "Tokens published by the service (from `about.json` `provides_tokens`); feed into dependents' `app_vars`.",
 			},
+			"provides_tokens_hash": schema.StringAttribute{
+				Computed: true,
+				MarkdownDescription: "Fingerprint of the `about.json` `provides_tokens` KEY SET. When the service's declared " +
+					"token set grows (a new token is added to about.json), this changes and the resource re-runs " +
+					"init to capture the new tokens — WITHOUT reinstalling the app.",
+			},
 			"health_endpoint": schema.StringAttribute{
 				Computed:            true,
 				MarkdownDescription: "Health endpoint from the service's `about.json` (used for drift probing).",
@@ -182,26 +189,10 @@ func (r *serviceResource) install(ctx context.Context, m *serviceModel) diag.Dia
 		return diags
 	}
 
-	tokens := map[string]string{}
-	runInit := m.RunInit.IsNull() || m.RunInit.IsUnknown() || m.RunInit.ValueBool()
-	port := about.DefaultPort
-	switch {
-	case runInit && about.InitPlaybook != "" && len(about.ProvidesTokens) > 0:
-		initIn := in
-		initIn.Playbook = about.InitPlaybookPath(service)
-		caps, err := r.runner.CaptureTokens(ctx, initIn, about.ProvidesTokens, ip, port)
-		if err != nil {
-			diags.AddError("Service init / token capture failed", err.Error())
-			return diags
-		}
-		tokens = caps
-	default:
-		// No init playbook — still synthesize the _ct_url tokens.
-		for tok, outputVar := range about.ProvidesTokens {
-			if outputVar == "_ct_url" {
-				tokens[tok] = fmt.Sprintf("http://%s:%d", ip, port)
-			}
-		}
+	tokens, d2 := r.captureTokens(ctx, about, m, in)
+	diags.Append(d2...)
+	if diags.HasError() {
+		return diags
 	}
 
 	tv, d := stringMapValue(ctx, tokens)
@@ -211,6 +202,80 @@ func (r *serviceResource) install(ctx context.Context, m *serviceModel) diag.Dia
 	}
 	m.ProvidesTokens = tv
 	m.AppVarsHash = types.StringValue(appVarsHash(appVars))
+	m.ProvidesTokensHash = types.StringValue(providesTokensSetHash(about))
+	m.HealthEndpoint = types.StringValue(about.Verification.HealthEndpoint)
+	m.LastApplied = types.StringValue(time.Now().UTC().Format(time.RFC3339))
+	m.ID = types.StringValue(service + "@" + ip)
+	return diags
+}
+
+// captureTokens runs the init playbook (when the service declares one and RunInit is on)
+// to capture provides_tokens, or synthesizes the _ct_url sentinels otherwise. Shared by
+// install() (post-install) and initOnly() (init without reinstall).
+func (r *serviceResource) captureTokens(ctx context.Context, about *ansible.About, m *serviceModel, in ansible.RunInput) (map[string]string, diag.Diagnostics) {
+	var diags diag.Diagnostics
+	tokens := map[string]string{}
+	runInit := m.RunInit.IsNull() || m.RunInit.IsUnknown() || m.RunInit.ValueBool()
+	ip := m.TargetIP.ValueString()
+	port := about.DefaultPort
+	switch {
+	case runInit && about.InitPlaybook != "" && len(about.ProvidesTokens) > 0:
+		initIn := in
+		initIn.Playbook = about.InitPlaybookPath(m.Service.ValueString())
+		caps, err := r.runner.CaptureTokens(ctx, initIn, about.ProvidesTokens, ip, port)
+		if err != nil {
+			diags.AddError("Service init / token capture failed", err.Error())
+			return tokens, diags
+		}
+		tokens = caps
+	default:
+		for tok, outputVar := range about.ProvidesTokens {
+			if outputVar == "_ct_url" {
+				tokens[tok] = fmt.Sprintf("http://%s:%d", ip, port)
+			}
+		}
+	}
+	return tokens, diags
+}
+
+// initOnly re-runs the init playbook to (re)capture provides_tokens WITHOUT re-running the
+// install. Used when only the declared token set changed (about.json grew a token): the app
+// is already installed and running, so reinstalling it would be wasteful and — for services
+// with live external state (e.g. a printer's serial connection) — risky.
+func (r *serviceResource) initOnly(ctx context.Context, m *serviceModel) diag.Diagnostics {
+	var diags diag.Diagnostics
+	service := m.Service.ValueString()
+	ip := m.TargetIP.ValueString()
+
+	about, err := ansible.LoadAbout(r.runner.RepoPath(), service)
+	if err != nil {
+		diags.AddError("about.json not found", err.Error())
+		return diags
+	}
+	appVars, d := toStringMap(ctx, m.AppVars)
+	diags.Append(d...)
+	if diags.HasError() {
+		return diags
+	}
+	in := ansible.RunInput{
+		TargetIP:    ip,
+		SSHUser:     m.SSHUser.ValueString(),
+		SSHPassword: m.SSHPassword.ValueString(),
+		AppVars:     appVars,
+	}
+	tokens, d2 := r.captureTokens(ctx, about, m, in)
+	diags.Append(d2...)
+	if diags.HasError() {
+		return diags
+	}
+	tv, d3 := stringMapValue(ctx, tokens)
+	diags.Append(d3...)
+	if diags.HasError() {
+		return diags
+	}
+	m.ProvidesTokens = tv
+	m.AppVarsHash = types.StringValue(appVarsHash(appVars))
+	m.ProvidesTokensHash = types.StringValue(providesTokensSetHash(about))
 	m.HealthEndpoint = types.StringValue(about.Verification.HealthEndpoint)
 	m.LastApplied = types.StringValue(time.Now().UTC().Format(time.RFC3339))
 	m.ID = types.StringValue(service + "@" + ip)
@@ -242,6 +307,9 @@ func (r *serviceResource) Read(ctx context.Context, req resource.ReadRequest, re
 	about, err := ansible.LoadAbout(r.runner.RepoPath(), state.Service.ValueString())
 	if err == nil {
 		state.HealthEndpoint = types.StringValue(about.Verification.HealthEndpoint)
+		// Refresh the declared-token-set fingerprint so a plan shows a diff when about.json
+		// grew a token since the last apply (drives the init-only re-run in Update).
+		state.ProvidesTokensHash = types.StringValue(providesTokensSetHash(about))
 		if ep := about.Verification.HealthEndpoint; ep != "" {
 			if !healthOK(state.TargetIP.ValueString(), about.DefaultPort, ep, about.Verification.HealthStatusCodes) {
 				state.LastApplied = types.StringValue("")
@@ -252,12 +320,33 @@ func (r *serviceResource) Read(ctx context.Context, req resource.ReadRequest, re
 }
 
 func (r *serviceResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
-	var plan serviceModel
+	var plan, state serviceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	resp.Diagnostics.Append(r.install(ctx, &plan)...)
+
+	// Decide reinstall vs init-only. A reinstall is needed only when an install-affecting
+	// input changed: the service, its target, the explicit playbook override, or app_vars.
+	// If the ONLY change is the declared token set (about.json grew a token — reflected in
+	// provides_tokens_hash), re-run init alone: the app is already installed and, for
+	// services with live external state, reinstalling it is wasteful and risky.
+	planAppVars, d := toStringMap(ctx, plan.AppVars)
+	resp.Diagnostics.Append(d...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	reinstall := plan.Service.ValueString() != state.Service.ValueString() ||
+		plan.TargetIP.ValueString() != state.TargetIP.ValueString() ||
+		plan.AppPlaybook.ValueString() != state.AppPlaybook.ValueString() ||
+		appVarsHash(planAppVars) != state.AppVarsHash.ValueString()
+
+	if reinstall {
+		resp.Diagnostics.Append(r.install(ctx, &plan)...)
+	} else {
+		resp.Diagnostics.Append(r.initOnly(ctx, &plan)...)
+	}
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -334,6 +423,22 @@ func appVarsHash(av map[string]string) string {
 	h := sha256.New()
 	for _, k := range keys {
 		fmt.Fprintf(h, "%s=%s\n", k, av[k])
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// providesTokensSetHash fingerprints the KEYS of about.json's provides_tokens (sorted).
+// Only the key set matters — a growing set means new tokens to capture; the values are
+// produced by the init run, not declared here.
+func providesTokensSetHash(about *ansible.About) string {
+	keys := make([]string, 0, len(about.ProvidesTokens))
+	for k := range about.ProvidesTokens {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	h := sha256.New()
+	for _, k := range keys {
+		fmt.Fprintf(h, "%s\n", k)
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }
