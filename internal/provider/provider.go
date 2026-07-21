@@ -123,7 +123,7 @@ func (p *servicesProvider) Configure(ctx context.Context, req provider.Configure
 }
 
 func (p *servicesProvider) Resources(_ context.Context) []func() resource.Resource {
-	return []func() resource.Resource{NewServiceResource}
+	return []func() resource.Resource{NewServiceResource, NewIntegrationResource}
 }
 
 func (p *servicesProvider) DataSources(_ context.Context) []func() datasource.DataSource {

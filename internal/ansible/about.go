@@ -73,3 +73,27 @@ func (a *About) InitPlaybookPath(service string) string {
 	}
 	return filepath.Join("playbooks", "applications", service, a.InitPlaybook)
 }
+
+// IntegrationPlaybook returns the playbook path for the integrations[] entry called
+// name, or "" when the service declares no such integration. Unlike `playbook` and
+// `init_playbook`, integrations[].playbook is already repo-root-relative (repo standard
+// §12.1: bare filenames fail because ansible-playbook runs with cwd=ansible_dir).
+func (a *About) IntegrationPlaybook(name string) string {
+	for _, in := range a.Integrations {
+		if in.Name == name {
+			return in.Playbook
+		}
+	}
+	return ""
+}
+
+// IntegrationTokens returns the token names the integrations[] entry called name
+// requires, so a caller can assert every one was supplied before running it.
+func (a *About) IntegrationTokens(name string) []string {
+	for _, in := range a.Integrations {
+		if in.Name == name {
+			return in.RequiresTokens
+		}
+	}
+	return nil
+}
